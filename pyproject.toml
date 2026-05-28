@@ -1,0 +1,24 @@
+[project]
+name = "hikonek-stream"
+version = "0.1.0"
+description = "Hik-Connect stream gateway for employee-monitor YOLO violation detection."
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.111.0",
+  "uvicorn[standard]>=0.30.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.2.0",
+  "opencv-python-headless>=4.9.0",
+  "hikconnect>=1.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
