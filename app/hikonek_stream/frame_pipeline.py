@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -29,7 +30,7 @@ class FramePipeline:
         self.events: deque[PredictionEvent] = deque(maxlen=settings.max_events)
         self.latest_frames: dict[str, bytes] = {}
         self.subscribers: set[asyncio.Queue[PredictionEvent]] = set()
-        self.tasks: list[asyncio.Task[None]] = []
+        self.tasks: dict[str, asyncio.Task[None]] = {}
         self._last_event_at: dict[tuple[str, str], float] = {}
         self._running = False
 
@@ -38,15 +39,12 @@ class FramePipeline:
             return
         self._running = True
         await self.refresh_cameras()
-        for camera in self.cameras.values():
-            if camera.streamUrl:
-                self.tasks.append(asyncio.create_task(self._camera_loop(camera)))
 
     async def stop(self) -> None:
         self._running = False
-        for task in self.tasks:
+        for task in self.tasks.values():
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.gather(*self.tasks.values(), return_exceptions=True)
         self.tasks.clear()
 
     async def refresh_cameras(self) -> None:
@@ -68,6 +66,18 @@ class FramePipeline:
                 configured[camera_id] = camera
 
         self.cameras = configured
+        if self._running:
+            self._sync_camera_tasks()
+
+    def _sync_camera_tasks(self) -> None:
+        for camera_id, task in list(self.tasks.items()):
+            if camera_id not in self.cameras or task.done():
+                task.cancel()
+                self.tasks.pop(camera_id, None)
+
+        for camera_id, camera in self.cameras.items():
+            if camera.streamUrl and camera_id not in self.tasks:
+                self.tasks[camera_id] = asyncio.create_task(self._camera_loop(camera))
 
     def subscribe(self) -> asyncio.Queue[PredictionEvent]:
         queue: asyncio.Queue[PredictionEvent] = asyncio.Queue(maxsize=100)
@@ -88,7 +98,14 @@ class FramePipeline:
 
                 camera.status = "online"
                 frame_jpeg = self._encode_jpeg(frame)
-                result = await self.ai_engine.predict(frame_jpeg, camera.id)
+                try:
+                    result = await self.ai_engine.predict(frame_jpeg, camera.id)
+                except Exception as exc:
+                    logger.warning("AI engine failed for %s: %s", camera.id, exc)
+                    self.latest_frames[camera.id] = frame_jpeg
+                    await self._handle_detections(camera, [])
+                    await asyncio.sleep(self.settings.frame_interval_seconds)
+                    continue
                 annotated = result.annotated_frame or self._annotate(frame, result.detections)
                 self.latest_frames[camera.id] = annotated
                 await self._handle_detections(camera, result.detections)
@@ -101,7 +118,12 @@ class FramePipeline:
             await asyncio.sleep(self.settings.frame_interval_seconds)
 
     def _read_frame(self, stream_url: str) -> np.ndarray | None:
-        capture = cv2.VideoCapture(stream_url)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;tcp|timeout;{self.settings.rtsp_timeout_microseconds}"
+        )
+        capture = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.settings.rtsp_timeout_microseconds / 1000)
+        capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.settings.rtsp_timeout_microseconds / 1000)
         try:
             ok, frame = capture.read()
             return frame if ok else None
@@ -186,4 +208,3 @@ class FramePipeline:
                 stale.append(queue)
         for queue in stale:
             self.unsubscribe(queue)
-
